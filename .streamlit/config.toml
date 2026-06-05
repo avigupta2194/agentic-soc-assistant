@@ -1,0 +1,14 @@
+# Streamlit configuration for the Agentic SOC Assistant
+
+[server]
+# Stop the file-watcher from scanning heavy ML packages (torch, transformers).
+# This silences the noisy torchvision/torch import tracebacks on reload.
+fileWatcherType = "none"
+
+[theme]
+# Dark SOC-console theme to match the app's custom styling
+base = "dark"
+primaryColor = "#06b6d4"
+backgroundColor = "#0b0f14"
+secondaryBackgroundColor = "#111827"
+textColor = "#e5e7eb"

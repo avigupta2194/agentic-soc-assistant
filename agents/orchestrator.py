@@ -1,30 +1,35 @@
 """
-Orchestrator Agent (LangGraph)
-==============================
-This is the core agent. It's built as a LangGraph state machine
-where each node performs one stage of the SOC triage workflow:
+Orchestrator (LangGraph)
+========================
+The triage workflow, built as a LangGraph state machine:
 
-    parse -> enrich -> mitre -> report
+    parse -> (enrich, only if IOCs were found) -> mitre -> report
 
-The "agentic" part: the enrich node examines each IOC and
-AUTONOMOUSLY decides which tools to call based on the IOC type.
-An IP gets VirusTotal + AbuseIPDB + GeoIP. A file hash only gets
-VirusTotal (AbuseIPDB doesn't handle hashes). The agent reasons
-about what enrichment is appropriate rather than blindly running
-everything on everything.
+Tool routing in the enrich node is deterministic: each IOC is
+routed to the tools that support its type. An IP gets VirusTotal +
+AbuseIPDB + GeoIP; a file hash only gets VirusTotal. Private
+(internal) IPs are never sent to external services. Rule-based
+routing is a deliberate choice: in security triage, predictable and
+auditable behaviour matters more than flexibility.
+
+The LLM (Gemini) is used where rules fall short: catching
+obfuscated IOCs and classifying the alert (parse node), and writing
+the analysis narrative (report node).
 
 The mitre node adds RAG: it retrieves relevant MITRE ATT&CK
 techniques from a local vector store to ground the analysis.
 
 LangGraph gives us:
   - A typed state object that flows through the graph
-  - Clear, inspectable nodes (great for debugging & interviews)
+  - Clear, inspectable nodes
+  - Conditional routing between nodes
   - Easy extensibility (add a node without rewiring everything)
 """
 
 from __future__ import annotations
 from typing import TypedDict, Optional
 import asyncio
+import ipaddress
 
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -76,19 +81,42 @@ async def parse_node(state: SOCState) -> SOCState:
 
 # -- Node 2: Enrich (the agentic core) --
 
+# Internal network ranges. Sending these to external threat-intel
+# services is pointless (they have no public reputation) and leaks
+# details of our internal network to a third party.
+_INTERNAL_NETWORKS = [
+    ipaddress.ip_network(n) for n in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # private
+        "127.0.0.0/8",                                    # loopback
+        "169.254.0.0/16",                                 # link-local
+    )
+]
+
+
+def is_internal_ip(value: str) -> bool:
+    """True if the IP belongs to a private/internal range."""
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(ip in net for net in _INTERNAL_NETWORKS)
+
+
 def _select_tools_for_ioc(ioc: IOC) -> list[str]:
     """
-    THE AGENTIC DECISION: given an IOC, decide which tools to call.
+    Decide which tools to call for an IOC, based on its type.
 
-    This is rule-based decisioning. The agent doesn't blindly run
-    every tool on every IOC -- it reasons about what's appropriate:
-      - IPs    -> VirusTotal + AbuseIPDB + GeoIP (full enrichment)
-      - Domains -> VirusTotal only (AbuseIPDB/GeoIP are IP-only)
-      - URLs   -> VirusTotal (via domain extraction)
-      - Hashes -> VirusTotal only (the others don't handle hashes)
-      - Emails -> none of these tools apply
+    Deterministic, rule-based routing (not an LLM decision):
+      - Public IPs   -> VirusTotal + AbuseIPDB + GeoIP
+      - Internal IPs -> none (kept in the report, not sent out)
+      - Domains      -> VirusTotal only (AbuseIPDB/GeoIP are IP-only)
+      - URLs         -> VirusTotal
+      - Hashes       -> VirusTotal only (the others don't handle hashes)
+      - Emails       -> none of these tools apply
     """
     if ioc.ioc_type == IOCType.IP:
+        if is_internal_ip(ioc.value):
+            return []
         return ["virustotal", "abuseipdb", "geolocation"]
     elif ioc.ioc_type == IOCType.DOMAIN:
         return ["virustotal"]
@@ -102,7 +130,7 @@ def _select_tools_for_ioc(ioc: IOC) -> list[str]:
 
 def enrich_node(state: SOCState) -> SOCState:
     """
-    For each IOC, autonomously select and call the right tools,
+    For each IOC, route it to the right tools, call them,
     then compute a threat score.
     """
     print("  [Node: enrich] Enriching IOCs with threat intel...")
@@ -111,8 +139,11 @@ def enrich_node(state: SOCState) -> SOCState:
 
     for ioc in parsed.iocs:
         tools_to_call = _select_tools_for_ioc(ioc)
-        print(f"    -> {ioc.ioc_type.value} '{ioc.value}': "
-              f"calling {tools_to_call or 'no tools'}")
+        if ioc.ioc_type == IOCType.IP and is_internal_ip(ioc.value):
+            reason = "internal IP, not sent to external services"
+        else:
+            reason = f"calling {tools_to_call or 'no tools'}"
+        print(f"    -> {ioc.ioc_type.value} '{ioc.value}': {reason}")
 
         enrichment = EnrichmentResult(ioc=ioc)
 
@@ -293,13 +324,28 @@ async def report_node(state: SOCState) -> SOCState:
     return state
 
 
+# -- Routing --
+
+def route_after_parse(state: SOCState) -> str:
+    """
+    Conditional edge: only run enrichment if parsing found IOCs.
+    With nothing to look up, skip straight to MITRE mapping and
+    avoid wasting rate-limited API calls.
+    """
+    parsed = state.get("parsed")
+    if parsed and parsed.iocs:
+        return "enrich"
+    print("  [Router] No IOCs found, skipping enrichment")
+    return "mitre"
+
+
 # -- Build the Graph --
 
 def build_soc_graph():
     """
     Wire the nodes into a LangGraph state machine.
 
-    Flow: parse -> enrich -> mitre -> report -> END
+    Flow: parse -> [enrich if IOCs found] -> mitre -> report -> END
     """
     graph = StateGraph(SOCState)
 
@@ -309,7 +355,11 @@ def build_soc_graph():
     graph.add_node("report", report_node)
 
     graph.set_entry_point("parse")
-    graph.add_edge("parse", "enrich")
+    graph.add_conditional_edges(
+        "parse",
+        route_after_parse,
+        {"enrich": "enrich", "mitre": "mitre"},
+    )
     graph.add_edge("enrich", "mitre")
     graph.add_edge("mitre", "report")
     graph.add_edge("report", END)

@@ -47,6 +47,7 @@ class ParsedAlert(BaseModel):
     iocs: list[IOC] = []
     timestamp: Optional[str] = None
     summary: str = ""
+    rejected_llm_iocs: list[str] = []  # LLM IOCs dropped by validation
 
 
 # -- Enrichment Models --

@@ -10,6 +10,8 @@ recall MITRE techniques from memory (unreliable), we retrieve them
 from a curated knowledge base and ground the analysis in real data.
 """
 
+from typing import Optional
+
 import chromadb
 from chromadb.utils import embedding_functions
 
@@ -17,6 +19,7 @@ from config import (
     CHROMA_PERSIST_DIR,
     CHROMA_COLLECTION_NAME,
     EMBEDDING_MODEL,
+    MITRE_MAX_DISTANCE,
 )
 
 # Module-level cache so we don't reload the model on every call
@@ -38,13 +41,19 @@ def _get_collection():
     return _collection
 
 
-def search_techniques(query: str, top_k: int = 3) -> list[dict]:
+def search_techniques(
+    query: str,
+    top_k: int = 3,
+    max_distance: Optional[float] = MITRE_MAX_DISTANCE,
+) -> list[dict]:
     """
     Find the MITRE ATT&CK techniques most relevant to the query text.
 
     Args:
         query: Alert text, IOC context, or threat description
-        top_k: How many techniques to return
+        top_k: Maximum number of techniques to return
+        max_distance: Drop matches with a distance above this
+            (weak matches). None disables the cutoff.
 
     Returns:
         List of dicts with technique id, name, tactics, description,
@@ -70,6 +79,12 @@ def search_techniques(query: str, top_k: int = 3) -> list[dict]:
             meta = results["metadatas"][0][i]
             doc = results["documents"][0][i]
             distance = results["distances"][0][i] if results.get("distances") else None
+
+            # Relevance cutoff: skip weak matches instead of always
+            # returning top_k, so unrelated techniques never reach the report
+            if (max_distance is not None and distance is not None
+                    and distance > max_distance):
+                continue
 
             # Truncate description for readability
             description = doc.split(". ", 1)[-1] if ". " in doc else doc
@@ -101,7 +116,8 @@ if __name__ == "__main__":
     for q in test_queries:
         print(f"\nQuery: '{q}'")
         print("-" * 60)
-        results = search_techniques(q, top_k=3)
+        # Cutoff disabled here so you can see raw distances for calibration
+        results = search_techniques(q, top_k=3, max_distance=None)
 
         if results and "error" in results[0]:
             print(f"  {results[0]['error']}")

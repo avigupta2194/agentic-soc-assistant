@@ -38,6 +38,12 @@ CHROMA_PERSIST_DIR = "./chroma_db"
 CHROMA_COLLECTION_NAME = "mitre_attack"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Fast, free, runs locally
 
+# Drop MITRE matches weaker than this. ChromaDB returns a distance
+# (lower = more similar). Calibrate by running:
+#   python -m tools.mitre_search
+# and checking the relevance values printed for good vs bad matches.
+MITRE_MAX_DISTANCE = 0.7
+
 
 # ── Severity Thresholds ──────────────────────────────────
 SEVERITY_LEVELS = {

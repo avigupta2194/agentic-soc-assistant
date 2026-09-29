@@ -1,41 +1,44 @@
 # 🛡️ Agentic SOC Assistant
 
-An autonomous Security Operations Center (SOC) analyst built with **LangGraph** and **Google Gemini**. Paste a raw security alert — a firewall log, phishing email, or IDS alert — and the agent autonomously extracts indicators of compromise, decides which threat-intelligence tools to query, maps findings to the MITRE ATT&CK framework, and produces a structured triage report with a severity rating and recommended response actions.
+An AI-assisted Security Operations Center (SOC) triage workflow built with **LangGraph** and **Google Gemini**. Paste a raw security alert (a firewall log, phishing email, or IDS alert) and it extracts indicators of compromise, enriches them with live threat intelligence, maps the alert to MITRE ATT&CK, and produces a structured triage report with a severity rating and recommended response actions.
 
-Unlike a hardcoded enrichment pipeline, this agent *reasons* about each indicator and chooses appropriate tools per IOC type. That autonomous decision-making is the core of what makes it agentic.
+The design splits work between rules and the LLM on purpose. Rules handle what needs to be predictable and auditable: tool routing and threat scoring. The LLM handles what rules can't: catching obfuscated indicators, classifying the alert, and writing the analysis.
 
 ---
 
 ## ✨ Key Features
 
-- **Autonomous tool selection** — the agent inspects each IOC and decides which tools to invoke (an IP gets full enrichment; a file hash only goes to VirusTotal; an email skips network tools entirely).
-- **Live threat intelligence** — real-time enrichment via VirusTotal, AbuseIPDB, and IP geolocation.
-- **RAG over MITRE ATT&CK** — semantic retrieval against a local ChromaDB vector store of 690+ attack techniques, grounding the analysis in real framework data rather than model memory.
-- **LLM-written triage narrative** — Gemini synthesizes the enrichment + retrieved techniques into a concise analyst-style report.
-- **Deterministic threat scoring** — a rule-based 0–100 score (separate from the LLM) keeps severity explainable and consistent.
-- **Graceful degradation** — rate limits, API failures, and malformed LLM responses are all handled without crashing; the agent always produces a usable report.
-- **Clean SOC dashboard** — a dark-themed Streamlit UI with severity badges, IOC detail panels, and MITRE technique cards.
+- **Two-pass IOC extraction**: regex for precise extraction of well-formed indicators, then an LLM pass to catch obfuscated or defanged ones (e.g. `hxxp://evil[.]com`).
+- **Hallucination guard on LLM output**: every indicator the LLM adds is refanged, format-checked, and must literally appear in the original alert. Anything that fails is rejected and logged.
+- **Type-based tool routing**: each IOC is routed to the tools that support it. Public IPs get VirusTotal + AbuseIPDB + geolocation, hashes and domains go to VirusTotal, emails skip network tools.
+- **Internal IP protection**: private addresses (10.x, 172.16-31.x, 192.168.x, loopback, link-local) stay in the report but are never sent to external services.
+- **Live threat intelligence**: real-time enrichment via VirusTotal, AbuseIPDB, and IP geolocation, with rate limiting for free-tier APIs.
+- **RAG over MITRE ATT&CK**: semantic retrieval against a local ChromaDB store of 690+ techniques, with a relevance cutoff so weak matches never reach the report.
+- **Deterministic threat scoring**: a rule-based 0-100 score, separate from the LLM, keeps severity explainable and consistent.
+- **Graceful degradation**: rate limits, API failures, and malformed LLM responses are handled without crashing. If the LLM is unavailable, the pipeline falls back to regex-only extraction and a template report.
+- **SOC dashboard**: a dark-themed Streamlit UI with severity badges, IOC detail panels, and MITRE technique cards.
 
 ---
 
 ## 🏗️ Architecture
 
-The pipeline is a **LangGraph state machine** with four nodes:
+The pipeline is a **LangGraph state machine** with four nodes and one conditional edge:
 
 ```
 Raw Alert
    │
    ▼
-[ parse ]   Extract IOCs (regex + LLM two-pass), classify alert type
+[ parse ]   Regex pass + LLM pass, LLM output verified against the alert
    │
+   ├── no IOCs found ──────────────┐
+   ▼                               │
+[ enrich ]  Route each IOC by type │ → VirusTotal / AbuseIPDB / GeoIP
+   │         (internal IPs skipped) + deterministic 0-100 scoring
+   ▼                               │
+[ mitre ]  ◄───────────────────────┘
+   │        RAG over MITRE ATT&CK (ChromaDB), weak matches dropped
    ▼
-[ enrich ]  AUTONOMOUS: per-IOC tool selection → VirusTotal / AbuseIPDB / GeoIP
-   │         + deterministic 0–100 threat scoring
-   ▼
-[ mitre ]   RAG: semantic search over MITRE ATT&CK (ChromaDB) for relevant techniques
-   │
-   ▼
-[ report ]  LLM synthesizes a grounded triage report (severity, analysis, actions)
+[ report ]  LLM writes a grounded analysis; severity comes from the score
    │
    ▼
 Triage Report
@@ -120,7 +123,7 @@ agentic-soc-assistant/
 ├── models.py               # Pydantic data models
 ├── agents/
 │   ├── parser.py           # Two-pass IOC extraction (regex + LLM)
-│   └── orchestrator.py     # LangGraph state machine (the agent)
+│   └── orchestrator.py     # LangGraph state machine (the workflow)
 ├── tools/
 │   ├── virustotal.py       # VirusTotal client
 │   ├── abuseipdb.py        # AbuseIPDB client
@@ -141,9 +144,24 @@ agentic-soc-assistant/
 
 **Why two-pass parsing?** Regex gives precise, fast extraction of well-formed IOCs; the LLM pass catches obfuscated/defanged indicators and classifies the alert. Regex for precision, LLM for recall.
 
+**How is LLM extraction kept honest?** An LLM can invent indicators. Every IOC it adds must pass two checks: it has to match the format of its claimed type, and it has to appear in the original alert text (after refanging both). This grounds the LLM's output in the source.
+
+**Why rule-based tool routing instead of LLM tool calling?** Which tools support which IOC type is a fixed fact, so rules route it reliably and every decision is auditable. The LLM is kept for the parts that need judgment.
+
 **Why is scoring rule-based, not LLM-based?** Threat scores need to be consistent and explainable. The LLM writes the narrative; deterministic rules produce the number. They're computed independently, which also surfaces useful disagreements between qualitative and quantitative assessments.
 
-**Why RAG for MITRE?** Asking an LLM to recall technique IDs from memory invites hallucination. Retrieving them from a curated vector store grounds the analysis in authoritative data.
+**Why RAG for MITRE?** Asking an LLM to recall technique IDs from memory invites hallucination. Retrieving them from a curated vector store grounds the analysis in authoritative data. A distance cutoff (`MITRE_MAX_DISTANCE` in `config.py`) drops weak matches instead of always returning the top 3.
+
+---
+
+## 🗺️ Known Limitations & Roadmap
+
+- **Prompt injection**: alert text is attacker-influenced and currently goes straight into LLM prompts. Next: clearly delimit untrusted input and validate outputs further.
+- **Retries**: network errors are caught inside the API clients, so the retry decorator rarely triggers. Next: let transient errors and 429s propagate so retries fire.
+- **Chunking**: each MITRE technique is embedded as one document, and the embedding model only reads roughly the first 256 tokens. Next: chunk long descriptions.
+- **Sequential enrichment**: IOCs are enriched one at a time.
+- **Evaluation**: no labeled eval set yet. Next: measure extraction precision/recall on labeled alerts.
+- **LLM-driven routing**: tool routing is rule-based by design. A future branch could send ambiguous alerts to an LLM tool-calling path.
 
 ---
 

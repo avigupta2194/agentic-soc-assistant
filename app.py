@@ -83,7 +83,7 @@ st.markdown("""
 # -- Sidebar --
 with st.sidebar:
     st.title("🛡️ SOC Assistant")
-    st.caption("Autonomous alert triage powered by LangGraph + Gemini")
+    st.caption("AI-assisted alert triage powered by LangGraph + Gemini")
 
     st.markdown("---")
     st.subheader("Load a sample alert")

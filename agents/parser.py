@@ -14,11 +14,12 @@ the LLM gives you recall and context understanding.
 
 import re
 import json
+import ipaddress
 from models import IOC, IOCType, ParsedAlert
 
 # ── Regex patterns for IOC extraction ─────────────────────
 
-# IPv4 address (excludes common private/loopback unless in alert context)
+# IPv4 address (private IPs are extracted here; the enrich step skips them)
 IP_PATTERN = re.compile(
     r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
     r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
@@ -56,6 +57,60 @@ SKIP_DOMAINS = {
     "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",
     "company.com", "example.com", "localhost",
 }
+
+
+# ── Refanging + validation (used to check LLM-found IOCs) ──
+
+def refang(text: str) -> str:
+    """
+    Turn defanged indicators back into their normal form.
+    Analysts "defang" IOCs so they can't be clicked by accident,
+    e.g. hxxp://evil[.]com or 1.2.3[.]4. We need the real form
+    to compare against the alert and to query threat intel.
+    """
+    t = re.sub(r"hxxp", "http", text, flags=re.IGNORECASE)
+    for fake, real in (("[.]", "."), ("(.)", "."), ("[dot]", "."),
+                       ("[:]", ":"), ("[at]", "@"), ("[@]", "@")):
+        t = t.replace(fake, real)
+    return t
+
+
+_HEX = {
+    IOCType.HASH_SHA256: re.compile(r"[a-fA-F0-9]{64}"),
+    IOCType.HASH_SHA1: re.compile(r"[a-fA-F0-9]{40}"),
+    IOCType.HASH_MD5: re.compile(r"[a-fA-F0-9]{32}"),
+}
+_GENERIC_DOMAIN = re.compile(
+    r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}"
+)
+
+
+def is_valid_format(value: str, ioc_type: IOCType) -> bool:
+    """Check that an IOC actually looks like the type it claims to be."""
+    if ioc_type == IOCType.IP:
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+    if ioc_type in _HEX:
+        return bool(_HEX[ioc_type].fullmatch(value))
+    if ioc_type == IOCType.DOMAIN:
+        return bool(_GENERIC_DOMAIN.fullmatch(value))
+    if ioc_type == IOCType.URL:
+        return bool(re.match(r"(?:https?|ftp)://\S+$", value))
+    if ioc_type == IOCType.EMAIL:
+        return bool(EMAIL_PATTERN.fullmatch(value))
+    return False
+
+
+def appears_in_alert(value: str, raw_text: str) -> bool:
+    """
+    Grounding check: the IOC must literally appear in the alert
+    (after refanging both sides). This stops the LLM from adding
+    indicators it made up.
+    """
+    return refang(value).lower() in refang(raw_text).lower()
 
 
 def extract_iocs_regex(raw_text: str) -> list[IOC]:
@@ -188,6 +243,7 @@ def parse_llm_response(
     summary = ""
     timestamp = None
     all_iocs = list(regex_iocs)  # Start with regex results
+    rejected: list[str] = []     # LLM IOCs that failed validation
 
     try:
         # Clean potential markdown fencing
@@ -216,16 +272,35 @@ def parse_llm_response(
         existing_values = {ioc.value.lower() for ioc in all_iocs}
 
         for new_ioc in data.get("additional_iocs", []):
-            value = new_ioc.get("value", "")
-            if value.lower() not in existing_values:
-                ioc_type_str = new_ioc.get("ioc_type", "").lower()
-                if ioc_type_str in ioc_type_map:
-                    all_iocs.append(IOC(
-                        value=value,
-                        ioc_type=ioc_type_map[ioc_type_str],
-                        context=new_ioc.get("context", "Found by LLM analysis"),
-                    ))
-                    existing_values.add(value.lower())
+            # Refang so we store the real, queryable form
+            value = refang(str(new_ioc.get("value", "")).strip())
+            ioc_type_str = str(new_ioc.get("ioc_type", "")).lower()
+
+            if not value or value.lower() in existing_values:
+                continue
+            if ioc_type_str not in ioc_type_map:
+                rejected.append(f"{value} (unknown type '{ioc_type_str}')")
+                continue
+            ioc_type = ioc_type_map[ioc_type_str]
+
+            # Check 1: does it look like what it claims to be?
+            if not is_valid_format(value, ioc_type):
+                rejected.append(f"{value} (invalid {ioc_type.value} format)")
+                continue
+            # Check 2: is it actually in the alert? (anti-hallucination)
+            if not appears_in_alert(value, raw_text):
+                rejected.append(f"{value} (not found in alert text)")
+                continue
+
+            all_iocs.append(IOC(
+                value=value,
+                ioc_type=ioc_type,
+                context=new_ioc.get("context", "Found by LLM analysis"),
+            ))
+            existing_values.add(value.lower())
+
+        if rejected:
+            print(f"  [parser] Rejected {len(rejected)} LLM IOC(s): {rejected}")
 
         # Update context for existing IOCs
         context_map = {
@@ -247,6 +322,7 @@ def parse_llm_response(
         iocs=all_iocs,
         timestamp=timestamp,
         summary=summary,
+        rejected_llm_iocs=rejected,
     )
 
 
